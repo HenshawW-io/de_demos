@@ -1,0 +1,49 @@
+"""cdo commands:"""
+
+# PRCPTOT
+cdo -yearsum -setvrange,1,inf input.nc prcptot.nc
+
+# Rx1day
+# There is a bug in rx5day where the rolling 5-day sum is not calculated. I did not want to risk producing a wrong result with rx1day either, so I created a chained operation that produces the expected result.
+cdo -L -f nc4 -yearmax -setvrange,0,inf input.nc rx1d.nc
+
+# Rx5day
+# there is a bug in rx5day where the rolling 5-day sum is not calculated. I created a chain operation that produces the expected result
+cdo -L -f nc4 -yearmax -runsum,5 -setvrange,0,inf input.nc rx5d.nc
+
+# R10mm
+cdo etccdi_r10mm input.nc r10.nc
+
+# R20mm
+cdo etccdi_r20mm input.nc r20.nc
+
+# SDII
+cdo etccdi_sdii input.nc sdii.nc
+
+# CDD
+cdo etccdi_cdd input.nc cdd.nc
+
+# CWD
+cdo etccdi_cwd input.nc cwd.nc
+
+# R25
+cdo -yearsum -gec,25.4 input.nc r25.nc
+
+# merge all one-year netCDFs into one netCDF containing all years
+cdo mergetime /path/to/singleyear/*.nc merged.nc
+
+# R95P/R99P
+# 1. select only wet days (rr > 1mm)
+cdo setrtomiss,-inf,0 -mul $infile -gtc,1 -mulc,$pr_factor $infile ${outfile}_wd.nc
+
+# 2. select base period data
+cdo selyear,$startboot/$endboot ${outfile}_wd.nc ${outfile}_wd_baseperiod.nc ($startboot = 1991, $endboot = 2000)
+
+# 3. 95th percentile across all wet days in base period
+cdo timpctl,95 ${outfile}_wd_baseperiod.nc -timmin ${outfile}_wd_baseperiod.nc -timmax ${outfile}_wd_baseperiod.nc ${outfile}_wd_baseperiod_95p.nc
+
+# 4.
+cdo -yearsum -mul ${outfile}_wd.nc -gt ${outfile}_wd_baseperiod_95p.nc ${outfile}_wd.nc r99p.nc
+
+R99PTOT/R95PTOT
+cdo -div prcptot.nc -mulc,100 r99p.nc r99ptot.nc
