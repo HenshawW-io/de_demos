@@ -1,0 +1,110 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: sentinel2-poller
+  namespace: argo
+spec:
+  schedule: "0 */6 * * *"   # every 6 hours
+  timezone: "UTC"
+  suspend: false
+  workflowSpec:
+    entrypoint: check-and-process
+    serviceAccountName: argo-workflow-sa
+    templates:
+
+      - name: check-and-process
+        steps:
+          - - name: check-new-data
+              template: check-stac-step
+          - - name: write-zarr
+              template: write-zarr-step
+              when: "{{steps.check-new-data.outputs.parameters.scene-count}} > 0"
+              arguments:
+                parameters:
+                  - name: items-json
+                    value: "{{steps.check-new-data.outputs.result}}"
+
+      # Step 1: Check for new STAC data
+      - name: check-stac-step
+        script:
+          image: my-geo-image:latest
+          imagePullPolicy: Never
+          command: [python]
+          source: |
+            import pystac_client, json
+            from datetime import datetime, timedelta
+
+            # Only look for scenes ingested in the last 6 hours
+            since = (datetime.utcnow() - timedelta(hours=6)).isoformat() + "Z"
+            now   = datetime.utcnow().isoformat() + "Z"
+
+            catalog = pystac_client.Client.open(
+                "https://earth-search.aws.element84.com/v1"
+            )
+            search = catalog.search(
+                collections=["sentinel-2-l2a"],
+                bbox=[16.20, 48.10, 16.50, 48.30],
+                datetime=f"{since}/{now}",
+                query={"eo:cloud_cover": {"lt": 20}},
+            )
+            items = [item.to_dict() for item in search.items()]
+
+            # Write count to a file Argo reads as an output parameter
+            with open("/tmp/count.txt", "w") as f:
+              f.write(str(len(items)))
+
+            # Print full payload as outputs.result
+            print(json.dumps(items))
+
+        outputs:
+          parameters:
+            - name: scene-count
+              valueFrom:
+                path: /tmp/count.txt
+
+      # Step 2: Dask + Zarr write -> only runs if new data found
+      - name: write-zarr-step
+        inputs:
+          parameters:
+            - name: items-json
+        script:
+          image: my-geo-image:latest
+          command: [python]
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+          source: |
+            import json, pystac, stackstac, numpy as np
+            from dask_kubernetes import KubeCluster
+            from dask.distributed import Client
+
+            # Deserialize items passed from step 1
+            items_dict = json.loads("""{{inputs.parameters.items-json}}""")
+            items = [pystac.Item.from_dict(d) for d in items_dict]
+
+            # Spin up ephemeral Dask cluster
+            cluster = KubeCluster("worker-spec.yaml")
+            cluster.scale(4)
+            client = Client(cluster)
+            print(f"Dashboard: {client.dashboard_link}")
+
+            # Build and write datacube
+            stack = stackstac.stack(
+                items, assets=["red", "nir"], resolution=60, dtype="float32"
+            )
+            ds = (
+                stack
+                .chunk({"time": 4, "band": 1, "y": 256, "x": 256})
+                .to_dataset(dim="band")
+            )
+
+            ds.to_zarr(
+                "s3://my-bucket/sentinel2.zarr",
+                mode="w",
+                zarr_format=2,
+                consolidated=True,
+            )
+            print("Done.")
+            client.close()
+            cluster.close()
